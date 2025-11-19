@@ -6,7 +6,7 @@
 // =================== НАСТРОЙКИ (МЕНЯЙ ЗДЕСЬ) ===================
 const float GROUND_ALTITUDE     = 140.0;   // высота твоей стартовой площадки над уровнем моря
 const float IGNITION_ALTITUDE   = 300.0;   // высота, на которой зажигается RD-50
-const float LIFTOFF_THRESHOLD   = 20.0;    // высота, при которой фиксируем старт (чтобы не срабатывало на земле)
+const float LIFTOFF_THRESHOLD   = 20.0;    // высота, при которой фиксируем старт
 
 const int SERVO_SEPARATION_ANGLE = 90;     // угол поворота двух серво для отделения ступени
 const int SERVO_PARACHUTE_ANGLE  = 180;    // угол поворота серво для раскрытия парашюта
@@ -15,7 +15,6 @@ const int PIN_SERVO_SEP1         = 9;
 const int PIN_SERVO_SEP2         = 10;
 const int PIN_SERVO_PARACHUTE    = 11;
 const int PIN_RELAY              = 7;      // реле → электрозапал
-const int PIN_PIEZO              = 8;      // пьезопищалка (опционально, можно не подключать)
 const int PIN_REPORT_BUTTON      = 2;      // замыкаем на GND для вывода отчёта после полёта
 
 const unsigned long IGNITER_BURN_TIME = 2000; // 2 секунды горения запала
@@ -43,17 +42,9 @@ bool engineIgnited     = false;
 bool stageSeparated    = false;
 bool parachuteDeployed = false;
 
-unsigned long ignitionTime = 0;        // ←←←← ЭТО БЫЛО ГЛАВНОЕ ИСПРАВЛЕНИЕ
-
-void beep(int count = 1, int duration = 200) {
-  for(int i = 0; i < count; i++) {
-    digitalWrite(PIN_PIEZO, HIGH); delay(duration);
-    digitalWrite(PIN_PIEZO, LOW);  delay(duration);
-  }
-}
+unsigned long ignitionTime = 0;
 
 void setup() {
-  pinMode(PIN_PIEZO, OUTPUT);
   pinMode(PIN_REPORT_BUTTON, INPUT_PULLUP);
 
   // === Если при включении пин 2 замкнут на GND — выводим отчёт и/или чистим память ===
@@ -74,7 +65,7 @@ void setup() {
 
   // BMP280 — автоматически ищет оба адреса 0x76 и 0x77
   if (!bmp.begin()) {
-    while(1) { beep(5, 100); delay(500); } // ошибка датчика — орём как резаные
+    while(1); // ошибка датчика — просто зависаем (без писка)
   }
 
   // Калибровка давления на земле (10 секунд)
@@ -87,7 +78,6 @@ void setup() {
 
   // Если уже летали — больше ничего не делаем
   if (EEPROM.read(ADDR_STATUS) == 1) {
-    beep(3, 500);
     while(1) delay(1000);
   }
 }
@@ -102,7 +92,6 @@ void loop() {
     EEPROM.put(ADDR_LIFTOFF_ALT, currentAltitude);
     EEPROM.put(ADDR_LIFTOFF_TIME, millis());
     liftoffRecorded = true;
-    // beep(2, 150);  // можно включить
   }
 
   // 1. Зажигание двигателя второй ступени
@@ -112,7 +101,6 @@ void loop() {
     EEPROM.put(ADDR_IGNITION_ALT, currentAltitude);
     EEPROM.put(ADDR_IGNITION_TIME, ignitionTime);
     engineIgnited = true;
-    // beep(1, 1000);
 
     delay(IGNITER_BURN_TIME);
     digitalWrite(PIN_RELAY, LOW);
@@ -125,7 +113,6 @@ void loop() {
     EEPROM.put(ADDR_SEPARATION_ALT, currentAltitude);
     EEPROM.put(ADDR_SEPARATION_TIME, millis());
     stageSeparated = true;
-    // beep(3, 120);
   }
 
   // 3. Определение апогея и раскрытие парашюта
@@ -145,8 +132,6 @@ void loop() {
     EEPROM.put(ADDR_PARACHUTE_TIME, millis());
     EEPROM.write(ADDR_STATUS, 1);        // ПОЛЁТ ЗАВЕРШЁН
     parachuteDeployed = true;
-
-    beep(10, 200); // радостная трель
   }
 
   previousAltitude = currentAltitude;
@@ -179,7 +164,7 @@ void printFlightReportAndClear() {
   EEPROM.get(ADDR_APOGEE_ALT, apogeeAlt);
   EEPROM.get(ADDR_PARACHUTE_TIME, paraT);
 
-  unsigned long startTime = liftoffT > 100 ? liftoffT : ignT; // если liftoff не поймали — от зажигания
+  unsigned long startTime = liftoffT > 100 ? liftoffT : ignT;
 
   Serial.print(F("Старт (liftoff):          ")); Serial.print(liftoffAlt, 1); Serial.println(F(" м"));
   Serial.print(F("Зажигание двигателя:      ")); Serial.print(ignAlt, 1); Serial.print(F(" м   (+")); Serial.print((ignT - startTime)/1000.0, 2); Serial.println(F(" с)"));
