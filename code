@@ -3,182 +3,271 @@
 #include <Servo.h>
 #include <EEPROM.h>
 
-// =================== НАСТРОЙКИ (МЕНЯЙ ЗДЕСЬ) ===================
-const float GROUND_ALTITUDE     = 140.0;   // высота твоей стартовой площадки над уровнем моря
-const float IGNITION_ALTITUDE   = 300.0;   // высота, на которой зажигается RD-50
-const float LIFTOFF_THRESHOLD   = 20.0;    // высота, при которой фиксируем старт
+// =================== НАСТРОЙКИ ===================
+const float GROUND_ALTITUDE        = 140.0;    // высот старта площ
+const float IGNITION_ALTITUDE      = 300.0;    // актив рд-50
+const float LIFTOFF_THRESHOLD      = 20.0;     // высота старта
+const unsigned long PARACHUTE_TIMER= 20000;    // авар парашют
 
-const int SERVO_SEPARATION_ANGLE = 90;     // угол поворота двух серво для отделения ступени
-const int SERVO_PARACHUTE_ANGLE  = 180;    // угол поворота серво для раскрытия парашюта
+const int SERVO_SEPARATION_ANGLE   = 90;       // угол для отделения
+const int SERVO_PARACHUTE_ANGLE    = 180;      // угол для парашюта
 
-const int PIN_SERVO_SEP1         = 9;
-const int PIN_SERVO_SEP2         = 10;
-const int PIN_SERVO_PARACHUTE    = 11;
-const int PIN_RELAY              = 7;      // реле → электрозапал
-const int PIN_REPORT_BUTTON      = 2;      // замыкаем на GND для вывода отчёта после полёта
+const int PIN_SERVO_SEP1           = 9;        // отдел2
+const int PIN_SERVO_SEP2           = 10;       // отдел2
+const int PIN_SERVO_PARACHUTE      = 11;       // парашют
+const int PIN_IGNITER_RELAY        = 7;        // запал
+const int PIN_STATUS_LED           = 13;       // мигалка
 
-const unsigned long IGNITER_BURN_TIME = 2000; // 2 секунды горения запала
+const unsigned long IGNITER_BURN_TIME = 2000;  // запал горит
 
-// Адреса в EEPROM
-#define ADDR_STATUS              0   // 1 байт: 0 = не летали, 1 = полёт завершён
-#define ADDR_LIFTOFF_ALT        10   // float
-#define ADDR_LIFTOFF_TIME       14   // unsigned long
-#define ADDR_IGNITION_ALT       18
-#define ADDR_IGNITION_TIME      22
-#define ADDR_SEPARATION_ALT     26
-#define ADDR_SEPARATION_TIME    30
-#define ADDR_APOGEE_ALT         34
-#define ADDR_PARACHUTE_ALT      38
-#define ADDR_PARACHUTE_TIME     42
-// ==============================================================
+// Адреса EEPROM
+#define ADDR_STATUS                0
+#define ADDR_LIFTOFF_ALT          10
+#define ADDR_LIFTOFF_TIME         14
+#define ADDR_IGNITION_ALT         18
+#define ADDR_IGNITION_TIME        22
+#define ADDR_SEPARATION_ALT       26
+#define ADDR_SEPARATION_TIME      30
+#define ADDR_APOGEE_ALT           34
+#define ADDR_PARACHUTE_ALT        38
+#define ADDR_PARACHUTE_TIME       42
+// =================================================
 
 Adafruit_BMP280 bmp;
 Servo servoSep1, servoSep2, servoParachute;
 
 float baselinePressure = 0;
+unsigned long flightStartTime = 0;
 
-bool liftoffRecorded   = false;
-bool engineIgnited     = false;
-bool stageSeparated    = false;
-bool parachuteDeployed = false;
+enum FlightState {
+  STATE_READY,      // нет
+  STATE_FLYING,     // щас 
+  STATE_DONE        // да
+};
 
-unsigned long ignitionTime = 0;
+FlightState currentState = STATE_READY;
 
 void setup() {
-  pinMode(PIN_REPORT_BUTTON, INPUT_PULLUP);
+  Serial.begin(115200);
+  pinMode(PIN_IGNITER_RELAY, OUTPUT);
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  
+  digitalWrite(PIN_IGNITER_RELAY, LOW);
+  digitalWrite(PIN_STATUS_LED, LOW);
 
-  // === Если при включении пин 2 замкнут на GND — выводим отчёт и/или чистим память ===
-  if (digitalRead(PIN_REPORT_BUTTON) == LOW) {
-    printFlightReportAndClear();
-    while(1); // зависаем, чтобы не начинать полёт
-  }
-
-  pinMode(PIN_RELAY, OUTPUT);
-  digitalWrite(PIN_RELAY, LOW);
-
+  // отдлеение серво
   servoSep1.attach(PIN_SERVO_SEP1);
-  servoSep2.attach(PIN_SERVO_SEP2);
+  servoSep2.attach(PIN_SERVO_SEP2); 
   servoParachute.attach(PIN_SERVO_PARACHUTE);
-  servoSep1.write(0);
-  servoSep2.write(0);
-  servoParachute.write(0);
+  resetServos();
 
-  // BMP280 — автоматически ищет оба адреса 0x76 и 0x77
+  // датчик бмп
   if (!bmp.begin()) {
-    while(1); // ошибка датчика — просто зависаем (без писка)
+    while(true) {
+      blinkPattern(3, 200); // 3 миг плохо
+      delay(1000);
+    }
   }
 
-  // Калибровка давления на земле (10 секунд)
-  baselinePressure = 0;
-  for (int i = 0; i < 100; i++) {
-    baselinePressure += bmp.readPressure();
-    delay(100);
-  }
-  baselinePressure /= 100.0;
+  // давка
+  calibratePressure();
 
-  // Если уже летали — больше ничего не делаем
+  // полёт пред
   if (EEPROM.read(ADDR_STATUS) == 1) {
-    while(1) delay(1000);
+    currentState = STATE_DONE;
   }
 }
 
 void loop() {
-  if (EEPROM.read(ADDR_STATUS) == 1) return; // полёт уже завершён
-
-  float currentAltitude = bmp.readAltitude(baselinePressure) - GROUND_ALTITUDE;
-
-  // 0. Фиксация старта ракеты
-  if (!liftoffRecorded && currentAltitude >= LIFTOFF_THRESHOLD) {
-    EEPROM.put(ADDR_LIFTOFF_ALT, currentAltitude);
-    EEPROM.put(ADDR_LIFTOFF_TIME, millis());
-    liftoffRecorded = true;
+  indicateState(currentState);
+  
+  switch(currentState) {
+    case STATE_READY:
+      handleReadyState();
+      break;
+    case STATE_FLYING:
+      handleFlyingState();
+      break;
+    case STATE_DONE:
+      // индикация
+      break;
   }
-
-  // 1. Зажигание двигателя второй ступени
-  if (!engineIgnited && currentAltitude >= IGNITION_ALTITUDE) {
-    digitalWrite(PIN_RELAY, HIGH);
-    ignitionTime = millis();
-    EEPROM.put(ADDR_IGNITION_ALT, currentAltitude);
-    EEPROM.put(ADDR_IGNITION_TIME, ignitionTime);
-    engineIgnited = true;
-
-    delay(IGNITER_BURN_TIME);
-    digitalWrite(PIN_RELAY, LOW);
-  }
-
-  // 2. Отделение первой ступени
-  if (engineIgnited && !stageSeparated && millis() - ignitionTime > IGNITER_BURN_TIME + 500) {
-    servoSep1.write(SERVO_SEPARATION_ANGLE);
-    servoSep2.write(SERVO_SEPARATION_ANGLE);
-    EEPROM.put(ADDR_SEPARATION_ALT, currentAltitude);
-    EEPROM.put(ADDR_SEPARATION_TIME, millis());
-    stageSeparated = true;
-  }
-
-  // 3. Определение апогея и раскрытие парашюта
-  static float previousAltitude = currentAltitude;
-  static unsigned long lastAscentTime = millis();
-  static float maxAltitude = currentAltitude;
-
-  if (currentAltitude > maxAltitude) {
-    maxAltitude = currentAltitude;
-    lastAscentTime = millis();
-  }
-
-  if (millis() - lastAscentTime > 800 && stageSeparated && !parachuteDeployed) {
-    servoParachute.write(SERVO_PARACHUTE_ANGLE);
-    EEPROM.put(ADDR_APOGEE_ALT, maxAltitude);
-    EEPROM.put(ADDR_PARACHUTE_ALT, maxAltitude);
-    EEPROM.put(ADDR_PARACHUTE_TIME, millis());
-    EEPROM.write(ADDR_STATUS, 1);        // ПОЛЁТ ЗАВЕРШЁН
-    parachuteDeployed = true;
-  }
-
-  previousAltitude = currentAltitude;
   delay(50);
 }
 
-// ===================== ВЫВОД ОТЧЁТА ПОСЛЕ ПОЛЁТА =====================
-void printFlightReportAndClear() {
-  Serial.begin(115200);
-  while (!Serial) delay(10);
-  delay(1000);
+void handleReadyState() {
+  float currentAltitude = getCurrentAltitude();
+  
+  if (currentAltitude >= LIFTOFF_THRESHOLD) {
+    recordLiftoff(currentAltitude);
+    currentState = STATE_FLYING;
+    flightStartTime = millis();
+  }
+}
 
-  Serial.println(F("\n=== ОТЧЁТ О ПОЛЁТЕ ВТОРОЙ СТУПЕНИ ==="));
+void handleFlyingState() {
+  float currentAltitude = getCurrentAltitude();
+  unsigned long flightTime = millis() - flightStartTime;
 
-  if (EEPROM.read(ADDR_STATUS) != 1) {
-    Serial.println(F("Полёт не был выполнен или данные стёрты."));
-    Serial.println(F("Для очистки памяти удерживай пин 2 на GND и нажми RESET ещё раз."));
-    return;
+  // движок
+  static bool engineIgnited = false;
+  if (!engineIgnited && currentAltitude >= IGNITION_ALTITUDE) {
+    igniteEngine(currentAltitude);
+    engineIgnited = true;
   }
 
-  float liftoffAlt, ignAlt, sepAlt, apogeeAlt, paraAlt;
-  unsigned long liftoffT = 0, ignT = 0, sepT = 0, paraT = 0;
+  // ступень
+  static bool stageSeparated = false;
+  if (engineIgnited && !stageSeparated && flightTime > 5000) {
+    separateStage(currentAltitude);
+    stageSeparated = true;
+  }
 
-  EEPROM.get(ADDR_LIFTOFF_ALT, liftoffAlt);
-  EEPROM.get(ADDR_LIFTOFF_TIME, liftoffT);
-  EEPROM.get(ADDR_IGNITION_ALT, ignAlt);
-  EEPROM.get(ADDR_IGNITION_TIME, ignT);
-  EEPROM.get(ADDR_SEPARATION_ALT, sepAlt);
-  EEPROM.get(ADDR_SEPARATION_TIME, sepT);
-  EEPROM.get(ADDR_APOGEE_ALT, apogeeAlt);
-  EEPROM.get(ADDR_PARACHUTE_TIME, paraT);
+  // парашута
+  static bool parachuteDeployed = false;
+  if (!parachuteDeployed && (detectApogee(currentAltitude) || flightTime > PARACHUTE_TIMER)) {
+    deployParachute(currentAltitude);
+    currentState = STATE_DONE;
+    parachuteDeployed = true;
+  }
+}
 
-  unsigned long startTime = liftoffT > 100 ? liftoffT : ignT;
+// мигалка
+void indicateState(FlightState state) {
+  static unsigned long lastBlink = 0;
+  
+  switch(state) {
+    case STATE_READY:
+      // 1 миг пауза 2с
+      if (millis() - lastBlink > 2000) {
+        digitalWrite(PIN_STATUS_LED, HIGH);
+        delay(200);
+        digitalWrite(PIN_STATUS_LED, LOW);
+        lastBlink = millis();
+      }
+      break;
+      
+    case STATE_FLYING:
+      // 5 миг пауза 3 сек
+      if (millis() - lastBlink > 3000) {
+        blinkPattern(5, 100);
+        lastBlink = millis();
+      }
+      break;
+      
+    case STATE_DONE:
+      // медленно миг в 1.5 сек
+      if (millis() - lastBlink > 1500) {
+        digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
+        lastBlink = millis();
+      }
+      break;
+  }
+}
 
-  Serial.print(F("Старт (liftoff):          ")); Serial.print(liftoffAlt, 1); Serial.println(F(" м"));
-  Serial.print(F("Зажигание двигателя:      ")); Serial.print(ignAlt, 1); Serial.print(F(" м   (+")); Serial.print((ignT - startTime)/1000.0, 2); Serial.println(F(" с)"));
-  Serial.print(F("Отделение ступени:        ")); Serial.print(sepAlt, 1); Serial.print(F(" м   (+")); Serial.print((sepT - startTime)/1000.0, 2); Serial.println(F(" с)"));
-  Serial.print(F("Апогей:                   ")); Serial.print(apogeeAlt, 1); Serial.println(F(" м"));
-  Serial.print(F("Раскрытие парашюта:       ")); Serial.print(apogeeAlt, 1); Serial.print(F(" м   (+")); Serial.print((paraT - startTime)/1000.0, 2); Serial.println(F(" с)"));
+void blinkPattern(int count, int duration) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(PIN_STATUS_LED, HIGH);
+    delay(duration);
+    digitalWrite(PIN_STATUS_LED, LOW);
+    if (i < count - 1) delay(duration);
+  }
+}
 
-  Serial.println(F("\n======================================="));
-  Serial.println(F("Для очистки памяти — удерживай пин 2 на GND"));
-  Serial.println(F("и нажми RESET ещё раз."));
+// функции
+float getCurrentAltitude() {
+  return bmp.readAltitude(baselinePressure) - GROUND_ALTITUDE;
+}
 
-  // Очистка памяти при двойном замыкании пина 2
-  if (digitalRead(PIN_REPORT_BUTTON) == LOW) {
-    for (int i = 0; i < EEPROM.length(); i++) EEPROM.write(i, 0xFF);
-    Serial.println(F("ПАМЯТЬ ОЧИЩЕНА! Теперь можно лететь снова."));
+void calibratePressure() {
+  baselinePressure = 0;
+  for (int i = 0; i < 50; i++) {
+    baselinePressure += bmp.readPressure();
+    delay(100);
+  }
+  baselinePressure /= 50.0;
+}
+
+void resetServos() {
+  servoSep1.write(0);
+  servoSep2.write(0);
+  servoParachute.write(0);
+}
+
+bool detectApogee(float currentAltitude) {
+  static float maxAltitude = 0;
+  static unsigned long descentStart = 0;
+  
+  if (currentAltitude > maxAltitude) {
+    maxAltitude = currentAltitude;
+    descentStart = 0;
+    return false;
+  } else {
+    if (descentStart == 0) {
+      descentStart = millis();
+    }
+    // 
+    return (millis() - descentStart > 1000);
+  }
+}
+
+void recordLiftoff(float altitude) {
+  EEPROM.put(ADDR_LIFTOFF_ALT, altitude);
+  EEPROM.put(ADDR_LIFTOFF_TIME, millis());
+}
+
+void igniteEngine(float altitude) {
+  digitalWrite(PIN_IGNITER_RELAY, HIGH);
+  EEPROM.put(ADDR_IGNITION_ALT, altitude);
+  EEPROM.put(ADDR_IGNITION_TIME, millis());
+  delay(IGNITER_BURN_TIME);
+  digitalWrite(PIN_IGNITER_RELAY, LOW);
+}
+
+void separateStage(float altitude) {
+  servoSep1.write(SERVO_SEPARATION_ANGLE);
+  servoSep2.write(SERVO_SEPARATION_ANGLE);
+  EEPROM.put(ADDR_SEPARATION_ALT, altitude);
+  EEPROM.put(ADDR_SEPARATION_TIME, millis());
+}
+
+void deployParachute(float altitude) {
+  servoParachute.write(SERVO_PARACHUTE_ANGLE);
+  EEPROM.put(ADDR_PARACHUTE_ALT, altitude);
+  EEPROM.put(ADDR_PARACHUTE_TIME, millis());
+  EEPROM.write(ADDR_STATUS, 1);
+}
+
+// ==================== ОТЧЁТ ====================
+void printFlightReport() {
+  if (Serial) {
+    Serial.println(F("\n=== ОТЧЁТ О ПОЛЁТЕ ==="));
+    
+    if (EEPROM.read(ADDR_STATUS) != 1) {
+      Serial.println(F("Данные о полёте отсутствуют"));
+      return;
+    }
+
+    float liftoffAlt, ignAlt, sepAlt, apogeeAlt, paraAlt;
+    unsigned long liftoffT, ignT, sepT, paraT;
+
+    EEPROM.get(ADDR_LIFTOFF_ALT, liftoffAlt);
+    EEPROM.get(ADDR_LIFTOFF_TIME, liftoffT);
+    EEPROM.get(ADDR_IGNITION_ALT, ignAlt);
+    EEPROM.get(ADDR_IGNITION_TIME, ignT);
+    EEPROM.get(ADDR_SEPARATION_ALT, sepAlt);
+    EEPROM.get(ADDR_SEPARATION_TIME, sepT);
+    EEPROM.get(ADDR_APOGEE_ALT, apogeeAlt);
+    EEPROM.get(ADDR_PARACHUTE_ALT, paraAlt);
+    EEPROM.get(ADDR_PARACHUTE_TIME, paraT);
+
+    Serial.print(F("Старт: ")); Serial.print(liftoffAlt); Serial.println(F(" м"));
+    Serial.print(F("Зажигание: ")); Serial.print(ignAlt); Serial.print(F(" м"));
+    Serial.print(F(" (+")); Serial.print((ignT-liftoffT)/1000.0); Serial.println(F(" с)"));
+    Serial.print(F("Отделение: ")); Serial.print(sepAlt); Serial.print(F(" м"));
+    Serial.print(F(" (+")); Serial.print((sepT-liftoffT)/1000.0); Serial.println(F(" с)"));
+    Serial.print(F("Апогей: ")); Serial.print(apogeeAlt); Serial.println(F(" м"));
+    Serial.print(F("Парашют: ")); Serial.print(paraAlt); Serial.print(F(" м"));
+    Serial.print(F(" (+")); Serial.print((paraT-liftoffT)/1000.0); Serial.println(F(" с)"));
   }
 }
