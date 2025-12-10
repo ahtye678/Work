@@ -1,273 +1,287 @@
-#include <Wire.h>
-#include <Adafruit_BMP280.h>
 #include <Servo.h>
-#include <EEPROM.h>
+#include <DHT.h>
 
-// =================== НАСТРОЙКИ ===================
-const float GROUND_ALTITUDE        = 140.0;    // высот старта площ
-const float IGNITION_ALTITUDE      = 300.0;    // актив рд-50
-const float LIFTOFF_THRESHOLD      = 20.0;     // высота старта
-const unsigned long PARACHUTE_TIMER= 20000;    // авар парашют
+// Пины устройств
+const int led1 = 2;
+const int led2 = 3;
+const int led3 = 4;
+const int led4 = 5;
+const int servo1Pin = 8;
+const int servo2Pin = 9;
+const int relayPin = A0;
 
-const int SERVO_SEPARATION_ANGLE   = 90;       // угол для отделения
-const int SERVO_PARACHUTE_ANGLE    = 180;      // угол для парашюта
+// Датчик DHT11
+#define DHTPIN 6      // Пин DATA датчика DHT11
+#define DHTTYPE DHT11 // Тип датчика
+DHT dht(DHTPIN, DHTTYPE); // Создаем объект датчика
 
-const int PIN_SERVO_SEP1           = 9;        // отдел2
-const int PIN_SERVO_SEP2           = 10;       // отдел2
-const int PIN_SERVO_PARACHUTE      = 11;       // парашют
-const int PIN_IGNITER_RELAY        = 7;        // запал
-const int PIN_STATUS_LED           = 13;       // мигалка
-
-const unsigned long IGNITER_BURN_TIME = 2000;  // запал горит
-
-// Адреса EEPROM
-#define ADDR_STATUS                0
-#define ADDR_LIFTOFF_ALT          10
-#define ADDR_LIFTOFF_TIME         14
-#define ADDR_IGNITION_ALT         18
-#define ADDR_IGNITION_TIME        22
-#define ADDR_SEPARATION_ALT       26
-#define ADDR_SEPARATION_TIME      30
-#define ADDR_APOGEE_ALT           34
-#define ADDR_PARACHUTE_ALT        38
-#define ADDR_PARACHUTE_TIME       42
-// =================================================
-
-Adafruit_BMP280 bmp;
-Servo servoSep1, servoSep2, servoParachute;
-
-float baselinePressure = 0;
-unsigned long flightStartTime = 0;
-
-enum FlightState {
-  STATE_READY,      // нет
-  STATE_FLYING,     // щас 
-  STATE_DONE        // да
+// Структура для хранения данных с привязкой к этапу
+struct SensorData {
+  unsigned long timeStamp;  // Время срабатывания этапа
+  int stepNumber;           // Номер этапа (1, 2, 3)
+  float temperature;        // Температура в момент этапа
+  float humidity;           // Влажность в момент этапа
 };
 
-FlightState currentState = STATE_READY;
+// Массив для хранения данных (последние 10 измерений)
+SensorData sensorLog[10];
+int logIndex = 0;
+
+Servo servo1;
+Servo servo2;
+
+// Переменные для хранения времени
+unsigned long startTime = 0;
+unsigned long currentTime = 0;
+bool programStarted = false;
+bool programCompleted = false;
+
+// Флаги выполненных шагов
+bool step1Done = false;
+bool step2Done = false;
+bool step3Done = false;
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(PIN_IGNITER_RELAY, OUTPUT);
-  pinMode(PIN_STATUS_LED, OUTPUT);
+  Serial.begin(9600);
   
-  digitalWrite(PIN_IGNITER_RELAY, LOW);
-  digitalWrite(PIN_STATUS_LED, LOW);
-
-  // отдлеение серво
-  servoSep1.attach(PIN_SERVO_SEP1);
-  servoSep2.attach(PIN_SERVO_SEP2); 
-  servoParachute.attach(PIN_SERVO_PARACHUTE);
-  resetServos();
-
-  // датчик бмп
-  if (!bmp.begin()) {
-    while(true) {
-      blinkPattern(3, 200); // 3 миг плохо
-      delay(1000);
-    }
-  }
-
-  // давка
-  calibratePressure();
-
-  // полёт пред
-  if (EEPROM.read(ADDR_STATUS) == 1) {
-    currentState = STATE_DONE;
-  }
+  // Инициализация устройств
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(led3, OUTPUT);
+  pinMode(led4, OUTPUT);
+  pinMode(relayPin, OUTPUT);
+  
+  servo1.attach(servo1Pin);
+  servo2.attach(servo2Pin);
+  
+  // Инициализация DHT11
+  dht.begin();
+  delay(1000); // Даем датчику время на инициализацию
+  
+  // Начальное состояние
+  resetDevices();
+  
+  startTime = millis();
+  programStarted = true;
+  programCompleted = false;
+  
+  Serial.println(F("==="));
+  printHelp();
 }
 
 void loop() {
-  indicateState(currentState);
+  if (!programStarted) return;
   
-  switch(currentState) {
-    case STATE_READY:
-      handleReadyState();
-      break;
-    case STATE_FLYING:
-      handleFlyingState();
-      break;
-    case STATE_DONE:
-      // индикация
-      break;
+  currentTime = millis() - startTime;
+  
+  if (!programCompleted) {
+    checkSchedule();
   }
+  
+  if (Serial.available()) {
+    handleCommand();
+  }
+  
   delay(50);
 }
 
-void handleReadyState() {
-  float currentAltitude = getCurrentAltitude();
+void handleCommand() {
+  String command = Serial.readString();
+  command.trim();
   
-  if (currentAltitude >= LIFTOFF_THRESHOLD) {
-    recordLiftoff(currentAltitude);
-    currentState = STATE_FLYING;
-    flightStartTime = millis();
+  if (command == "info") {
+    printAllData();
+  }
+  else if (command == "restart") {
+    resetProgram();
+  }
+  else if (command == "clean") {
+    clearSensorLog();
+  }
+  else if (command == "help") {
+    printHelp();
+  }
+  else if (command == "sensors") {
+    printSensorLog();  // Вывод всех сохраненных данных с датчика
   }
 }
 
-void handleFlyingState() {
-  float currentAltitude = getCurrentAltitude();
-  unsigned long flightTime = millis() - flightStartTime;
-
-  // движок
-  static bool engineIgnited = false;
-  if (!engineIgnited && currentAltitude >= IGNITION_ALTITUDE) {
-    igniteEngine(currentAltitude);
-    engineIgnited = true;
+void checkSchedule() {
+  if (!step1Done && currentTime >= 20000) {
+    executeStep1();
+    step1Done = true;
   }
-
-  // ступень
-  static bool stageSeparated = false;
-  if (engineIgnited && !stageSeparated && flightTime > 5000) {
-    separateStage(currentAltitude);
-    stageSeparated = true;
+  else if (!step2Done && currentTime >= 30000) {
+    executeStep2();
+    step2Done = true;
   }
-
-  // парашута
-  static bool parachuteDeployed = false;
-  if (!parachuteDeployed && (detectApogee(currentAltitude) || flightTime > PARACHUTE_TIMER)) {
-    deployParachute(currentAltitude);
-    currentState = STATE_DONE;
-    parachuteDeployed = true;
+  else if (!step3Done && currentTime >= 35000) {
+    executeStep3();
+    step3Done = true;
+    programCompleted = true;
   }
 }
 
-// мигалка
-void indicateState(FlightState state) {
-  static unsigned long lastBlink = 0;
+void executeStep1() {
+  digitalWrite(led1, LOW);
+  digitalWrite(led2, HIGH);
+  servo1.write(90);
+  Serial.println(F(">>> 20сек: LED2, Servo1 90°, LED1 выкл"));
   
-  switch(state) {
-    case STATE_READY:
-      // 1 миг пауза 2с
-      if (millis() - lastBlink > 2000) {
-        digitalWrite(PIN_STATUS_LED, HIGH);
-        delay(200);
-        digitalWrite(PIN_STATUS_LED, LOW);
-        lastBlink = millis();
-      }
-      break;
-      
-    case STATE_FLYING:
-      // 5 миг пауза 3 сек
-      if (millis() - lastBlink > 3000) {
-        blinkPattern(5, 100);
-        lastBlink = millis();
-      }
-      break;
-      
-    case STATE_DONE:
-      // медленно миг в 1.5 сек
-      if (millis() - lastBlink > 1500) {
-        digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
-        lastBlink = millis();
-      }
-      break;
-  }
+  // Считываем данные с DHT11 после срабатывания этапа
+  delay(100); // Небольшая задержка для стабилизации
+  readAndSaveSensorData(1);
 }
 
-void blinkPattern(int count, int duration) {
-  for (int i = 0; i < count; i++) {
-    digitalWrite(PIN_STATUS_LED, HIGH);
-    delay(duration);
-    digitalWrite(PIN_STATUS_LED, LOW);
-    if (i < count - 1) delay(duration);
-  }
-}
-
-// функции
-float getCurrentAltitude() {
-  return bmp.readAltitude(baselinePressure) - GROUND_ALTITUDE;
-}
-
-void calibratePressure() {
-  baselinePressure = 0;
-  for (int i = 0; i < 50; i++) {
-    baselinePressure += bmp.readPressure();
-    delay(100);
-  }
-  baselinePressure /= 50.0;
-}
-
-void resetServos() {
-  servoSep1.write(0);
-  servoSep2.write(0);
-  servoParachute.write(0);
-}
-
-bool detectApogee(float currentAltitude) {
-  static float maxAltitude = 0;
-  static unsigned long descentStart = 0;
+void executeStep2() {
+  digitalWrite(led2, LOW);
+  digitalWrite(led3, HIGH);
+  digitalWrite(relayPin, HIGH);
+  Serial.println(F(">>> 30сек: LED3, LED2 выкл, реле ВКЛ"));
   
-  if (currentAltitude > maxAltitude) {
-    maxAltitude = currentAltitude;
-    descentStart = 0;
-    return false;
-  } else {
-    if (descentStart == 0) {
-      descentStart = millis();
-    }
-    // 
-    return (millis() - descentStart > 1000);
-  }
+  // Считываем данные с DHT11 после срабатывания этапа
+  delay(100);
+  readAndSaveSensorData(2);
 }
 
-void recordLiftoff(float altitude) {
-  EEPROM.put(ADDR_LIFTOFF_ALT, altitude);
-  EEPROM.put(ADDR_LIFTOFF_TIME, millis());
+void executeStep3() {
+  digitalWrite(led3, LOW);
+  digitalWrite(led4, HIGH);
+  servo2.write(90);
+  Serial.println(F(">>> 35сек: LED4, Servo2 90°, LED3 выкл"));
+  
+  // Считываем данные с DHT11 после срабатывания этапа
+  delay(100);
+  readAndSaveSensorData(3);
 }
 
-void igniteEngine(float altitude) {
-  digitalWrite(PIN_IGNITER_RELAY, HIGH);
-  EEPROM.put(ADDR_IGNITION_ALT, altitude);
-  EEPROM.put(ADDR_IGNITION_TIME, millis());
-  delay(IGNITER_BURN_TIME);
-  digitalWrite(PIN_IGNITER_RELAY, LOW);
-}
-
-void separateStage(float altitude) {
-  servoSep1.write(SERVO_SEPARATION_ANGLE);
-  servoSep2.write(SERVO_SEPARATION_ANGLE);
-  EEPROM.put(ADDR_SEPARATION_ALT, altitude);
-  EEPROM.put(ADDR_SEPARATION_TIME, millis());
-}
-
-void deployParachute(float altitude) {
-  servoParachute.write(SERVO_PARACHUTE_ANGLE);
-  EEPROM.put(ADDR_PARACHUTE_ALT, altitude);
-  EEPROM.put(ADDR_PARACHUTE_TIME, millis());
-  EEPROM.write(ADDR_STATUS, 1);
-}
-
-// ==================== ОТЧЁТ ====================
-void printFlightReport() {
-  if (Serial) {
-    Serial.println(F("\n=== ОТЧЁТ О ПОЛЁТЕ ==="));
+void readAndSaveSensorData(int stepNum) {
+  // Даем датчику дополнительное время для подготовки
+  delay(2000); // DHT11 требует минимум 2 секунды между измерениями
+  
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  
+  // Проверяем, успешно ли прошло чтение
+  if (isnan(h) || isnan(t)) {
+    Serial.print(F("Ошибка чтения DHT11 на этапе "));
+    Serial.println(stepNum);
     
-    if (EEPROM.read(ADDR_STATUS) != 1) {
-      Serial.println(F("Данные о полёте отсутствуют"));
-      return;
-    }
-
-    float liftoffAlt, ignAlt, sepAlt, apogeeAlt, paraAlt;
-    unsigned long liftoffT, ignT, sepT, paraT;
-
-    EEPROM.get(ADDR_LIFTOFF_ALT, liftoffAlt);
-    EEPROM.get(ADDR_LIFTOFF_TIME, liftoffT);
-    EEPROM.get(ADDR_IGNITION_ALT, ignAlt);
-    EEPROM.get(ADDR_IGNITION_TIME, ignT);
-    EEPROM.get(ADDR_SEPARATION_ALT, sepAlt);
-    EEPROM.get(ADDR_SEPARATION_TIME, sepT);
-    EEPROM.get(ADDR_APOGEE_ALT, apogeeAlt);
-    EEPROM.get(ADDR_PARACHUTE_ALT, paraAlt);
-    EEPROM.get(ADDR_PARACHUTE_TIME, paraT);
-
-    Serial.print(F("Старт: ")); Serial.print(liftoffAlt); Serial.println(F(" м"));
-    Serial.print(F("Зажигание: ")); Serial.print(ignAlt); Serial.print(F(" м"));
-    Serial.print(F(" (+")); Serial.print((ignT-liftoffT)/1000.0); Serial.println(F(" с)"));
-    Serial.print(F("Отделение: ")); Serial.print(sepAlt); Serial.print(F(" м"));
-    Serial.print(F(" (+")); Serial.print((sepT-liftoffT)/1000.0); Serial.println(F(" с)"));
-    Serial.print(F("Апогей: ")); Serial.print(apogeeAlt); Serial.println(F(" м"));
-    Serial.print(F("Парашют: ")); Serial.print(paraAlt); Serial.print(F(" м"));
-    Serial.print(F(" (+")); Serial.print((paraT-liftoffT)/1000.0); Serial.println(F(" с)"));
+    // Сохраняем данные с отметкой об ошибке
+    sensorLog[logIndex].timeStamp = currentTime;
+    sensorLog[logIndex].stepNumber = stepNum;
+    sensorLog[logIndex].temperature = -99.9;  // Значение для ошибки
+    sensorLog[logIndex].humidity = -99.9;     // Значение для ошибки
+  } else {
+    // Сохраняем успешные данные
+    sensorLog[logIndex].timeStamp = currentTime;
+    sensorLog[logIndex].stepNumber = stepNum;
+    sensorLog[logIndex].temperature = t;
+    sensorLog[logIndex].humidity = h;
+    
+    Serial.print(F("DHT11 - Этап "));
+    Serial.print(stepNum);
+    Serial.print(F(": T="));
+    Serial.print(t);
+    Serial.print(F("°C, H="));
+    Serial.print(h);
+    Serial.println(F("%"));
   }
+  
+  // Переходим к следующей ячейке в логе (циклический буфер)
+  logIndex = (logIndex + 1) % 10;
+}
+
+void printAllData() {
+  Serial.println(F("==="));
+  printCurrentState();
+  Serial.println(F("--- ДАННЫЕ СЕНСОРОВ ---"));
+  printSensorLog();
+  Serial.println(F("==="));
+}
+
+void printCurrentState() {
+  Serial.println(F("==="));
+  Serial.print(F("LED1: ")); Serial.println(digitalRead(led1) ? "ВКЛ" : "ВЫКЛ");
+  Serial.print(F("LED2: ")); Serial.println(digitalRead(led2) ? "ВКЛ" : "ВЫКЛ");
+  Serial.print(F("LED3: ")); Serial.println(digitalRead(led3) ? "ВКЛ" : "ВЫКЛ");
+  Serial.print(F("LED4: ")); Serial.println(digitalRead(led4) ? "ВКЛ" : "ВЫКЛ");
+  Serial.print(F("Реле: ")); Serial.println(digitalRead(relayPin) ? "ВКЛ" : "ВЫКЛ");
+  Serial.print(F("Servo1: ")); Serial.print(servo1.read()); Serial.println(F("°"));
+  Serial.print(F("Servo2: ")); Serial.print(servo2.read()); Serial.println(F("°"));
+  Serial.println(F("==="));
+}
+
+void printSensorLog() {
+  bool hasData = false;
+  
+  for (int i = 0; i < 10; i++) {
+    int idx = (logIndex - i - 1 + 10) % 10; // Читаем в обратном порядке
+    
+    if (sensorLog[idx].stepNumber != 0) { // Проверяем, есть ли данные
+      hasData = true;
+      Serial.print(F("Этап "));
+      Serial.print(sensorLog[idx].stepNumber);
+      Serial.print(F(" (T+"));
+      Serial.print(sensorLog[idx].timeStamp / 1000);
+      Serial.print(F("с): "));
+      
+      if (sensorLog[idx].temperature == -99.9) {
+        Serial.println(F("Ошибка чтения датчика"));
+      } else {
+        Serial.print(F("T="));
+        Serial.print(sensorLog[idx].temperature);
+        Serial.print(F("°C, H="));
+        Serial.print(sensorLog[idx].humidity);
+        Serial.println(F("%"));
+      }
+    }
+  }
+  
+  if (!hasData) {
+    Serial.println(F("Нет данных с датчиков"));
+  }
+}
+
+void clearSensorLog() {
+  // Очищаем лог сенсоров
+  for (int i = 0; i < 10; i++) {
+    sensorLog[i].stepNumber = 0;
+    sensorLog[i].temperature = 0;
+    sensorLog[i].humidity = 0;
+    sensorLog[i].timeStamp = 0;
+  }
+  logIndex = 0;
+  Serial.println(F("Лог датчиков очищен"));
+}
+
+void resetDevices() {
+  digitalWrite(led1, HIGH);
+  digitalWrite(led2, LOW);
+  digitalWrite(led3, LOW);
+  digitalWrite(led4, LOW);
+  digitalWrite(relayPin, LOW);
+  servo1.write(0);
+  servo2.write(0);
+}
+
+void resetProgram() {
+  resetDevices();
+  startTime = millis();
+  currentTime = 0;
+  programCompleted = false;
+  step1Done = false;
+  step2Done = false;
+  step3Done = false;
+  Serial.println(F("Программа перезапущена"));
+}
+
+void printHelp() {
+  Serial.println(F("==="));
+  Serial.println(F("info     - полная информация"));
+  Serial.println(F("sensors  - данные с датчиков"));
+  Serial.println(F("restart  - перезапуск программы"));
+  Serial.println(F("clean    - очистка лога датчиков"));
+  Serial.println(F("help     - справка"));
+  Serial.println(F("==="));
 }
